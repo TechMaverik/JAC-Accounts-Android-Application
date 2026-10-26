@@ -2,10 +2,13 @@ package com.example.jacaccounts.ui
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.jacaccounts.data.Bank
-import com.example.jacaccounts.data.Credit
+import com.example.jacaccounts.data.Account
+import com.example.jacaccounts.data.DEFAULT_CURRENCY
+import com.example.jacaccounts.data.Debt
 import com.example.jacaccounts.data.Entry
 import com.example.jacaccounts.data.MongoRepository
+import com.example.jacaccounts.data.Rates
+import com.example.jacaccounts.data.Transfer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -15,10 +18,13 @@ import kotlinx.coroutines.launch
 data class UiState(
     val loading: Boolean = false,
     val error: String? = null,
-    val banks: List<Bank> = emptyList(),
+    val accounts: List<Account> = emptyList(),
     val expenses: List<Entry> = emptyList(),
     val income: List<Entry> = emptyList(),
-    val credits: List<Credit> = emptyList(),
+    val transfers: List<Transfer> = emptyList(),
+    val debts: List<Debt> = emptyList(),
+    val rates: Rates = Rates(emptyList()),
+    val displayCurrency: String = DEFAULT_CURRENCY,
 )
 
 class JacViewModel(private val repo: MongoRepository = MongoRepository()) : ViewModel() {
@@ -28,26 +34,45 @@ class JacViewModel(private val repo: MongoRepository = MongoRepository()) : View
     init { refresh() }
 
     fun refresh() = run {
-        val banks = repo.listBanks()
+        val accounts = repo.listAccounts()
         val expenses = repo.listExpenses()
         val income = repo.listIncome()
-        val credits = repo.listCredits()
-        _state.update { it.copy(banks = banks, expenses = expenses, income = income, credits = credits) }
+        val transfers = repo.listTransfers()
+        val debts = repo.listDebts()
+        val rates = Rates(repo.listRates())
+        val display = repo.displayCurrency()
+        _state.update {
+            it.copy(
+                accounts = accounts, expenses = expenses, income = income, transfers = transfers,
+                debts = debts, rates = rates, displayCurrency = display,
+            )
+        }
     }
 
     fun clearError() = _state.update { it.copy(error = null) }
 
-    fun addBank(name: String, currency: String) = mutate { repo.addBank(name, currency) }
-    fun deleteBank(id: String) = mutate { repo.deleteBank(id) }
-    fun addExpense(bank: Bank, amount: Double, date: Long, usedFor: String) = mutate { repo.addExpense(bank, amount, date, usedFor) }
-    fun deleteExpense(id: String) = mutate { repo.deleteExpense(id) }
-    fun addIncome(bank: Bank, amount: Double, date: Long, source: String) = mutate { repo.addIncome(bank, amount, date, source) }
-    fun deleteIncome(id: String) = mutate { repo.deleteIncome(id) }
-    fun addCredit(creditor: String, amount: Double, paid: Double) = mutate { repo.addCredit(creditor, amount, paid) }
-    fun addCreditPayment(id: String, extra: Double) = mutate { repo.addCreditPayment(id, extra) }
-    fun deleteCredit(id: String) = mutate { repo.deleteCredit(id) }
+    fun addAccount(name: String, currency: String) = mutate { repo.addAccount(name, currency) }
+    fun addExpense(account: Account, amount: Double, date: Long, category: String) = mutate { repo.addExpense(account, amount, date, category); null }
+    fun deleteExpense(id: String) = mutate { repo.deleteExpense(id); null }
+    fun addIncome(account: Account, amount: Double, date: Long, category: String) = mutate { repo.addIncome(account, amount, date, category); null }
+    fun deleteIncome(id: String) = mutate { repo.deleteIncome(id); null }
+    fun addTransfer(from: Account, to: Account, amount: Double, category: String, date: Long, rate: Double) =
+        mutate { repo.addTransfer(from, to, amount, category, date, rate); null }
+    fun addDebt(name: String, amount: Double, description: String, currency: String) =
+        mutate { repo.addDebt(name, amount, description, currency); null }
 
-    private fun mutate(write: suspend () -> Unit) = run { write(); refresh().join() }
+    fun addDebtPayment(debt: Debt, amount: Double, date: Long, from: Account?) = mutate {
+        val spent = from?.let { _state.value.rates.convert(amount, debt.currency, it.currency) }
+        if (from != null && spent == null) "No exchange rate for ${debt.currency} to ${from.currency}."
+        else { repo.addDebtPayment(debt, amount, date, from, spent); null }
+    }
+
+    /** Runs a write that may return a validation message, then reloads. */
+    private fun mutate(write: suspend () -> String?) = run {
+        val problem = write()
+        if (problem != null) _state.update { it.copy(error = problem) }
+        refresh().join()
+    }
 
     private fun run(block: suspend () -> Unit) = viewModelScope.launch {
         _state.update { it.copy(loading = true) }

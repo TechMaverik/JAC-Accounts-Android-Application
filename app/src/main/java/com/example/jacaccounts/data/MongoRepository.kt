@@ -5,16 +5,23 @@ import com.mongodb.ConnectionString
 import com.mongodb.MongoClientSettings
 import com.mongodb.client.model.Filters
 import com.mongodb.client.model.Sorts
-import com.mongodb.client.model.Updates
 import com.mongodb.kotlin.client.MongoClient
 import com.mongodb.kotlin.client.MongoCollection
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneOffset
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.bson.Document
 import org.bson.types.ObjectId
 
-/** All access is confined to the jac_accounts database. Calls are blocking, so they run on IO. */
+/**
+ * All access is confined to the jac_accounts database, whose collections mirror the Flask app's SQLite
+ * tables (currency-dynamic branch). Amounts and dates are stored there as strings ("12.5", "2026-08-20"),
+ * each document carries the SQLite integer `id`, and accounts are referenced by name.
+ * Calls are blocking, so they run on IO.
+ */
 class MongoRepository {
     private val client: MongoClient by lazy {
         MongoClient.create(
@@ -26,90 +33,157 @@ class MongoRepository {
         )
     }
     private val db get() = client.getDatabase(BuildConfig.MONGO_DB)
-    private val banks: MongoCollection<Document> get() = db.getCollection("banks")
-    private val expenses: MongoCollection<Document> get() = db.getCollection("expenses")
-    private val incomes: MongoCollection<Document> get() = db.getCollection("income")
-    private val credits: MongoCollection<Document> get() = db.getCollection("credits")
+    private fun col(name: String): MongoCollection<Document> = db.getCollection(name)
 
     private suspend fun <T> io(block: () -> T): T = withContext(Dispatchers.IO) { block() }
 
-    // ---- Banks ----
-    suspend fun listBanks(): List<Bank> = io {
-        banks.find().sort(Sorts.ascending("name")).map {
-            Bank(it.getObjectId("_id").toHexString(), it.getString("name"), it.getString("currency"))
+    // ---- helpers ----
+    private fun Document.text(key: String) = get(key)?.toString().orEmpty()
+    private fun Document.number(key: String) = get(key)?.toString()?.toDoubleOrNull() ?: 0.0
+    private fun Document.hexId() = getObjectId("_id").toHexString()
+
+    private fun parseDate(s: String): Long = runCatching {
+        LocalDate.parse(s.take(10)).atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
+    }.getOrDefault(0L)
+
+    private fun formatDate(millis: Long): String =
+        Instant.ofEpochMilli(millis).atZone(ZoneOffset.UTC).toLocalDate().toString()
+
+    /** SQLite-style AUTOINCREMENT: one past the highest `id` in the collection. */
+    private fun nextId(c: MongoCollection<Document>): Int =
+        ((c.find().sort(Sorts.descending("id")).limit(1).firstOrNull()?.get("id") as? Number)?.toInt() ?: 0) + 1
+
+    // ---- Accounts (banker) ----
+    suspend fun listAccounts(): List<Account> = io {
+        col("banker").find().sort(Sorts.ascending("id")).map {
+            Account(it.hexId(), it.text("account_name"), normaliseCurrency(it.text("currency")))
         }.toList()
     }
 
-    suspend fun addBank(name: String, currency: String) = io {
-        banks.insertOne(Document("name", name).append("currency", currency).append("createdAt", now()))
-        Unit
+    /** Names are unique (case-insensitively) because transactions join on them. Returns an error or null. */
+    suspend fun addAccount(name: String, currency: String): String? = io {
+        val c = col("banker")
+        if (c.find().toList().any { it.text("account_name").equals(name, ignoreCase = true) })
+            return@io "An account named $name already exists."
+        c.insertOne(Document("id", nextId(c)).append("account_name", name).append("currency", currency))
+        null
     }
 
-    suspend fun deleteBank(id: String) = io {
-        banks.deleteOne(Filters.eq("_id", ObjectId(id)))
-        Unit
-    }
-
-    // ---- Expenses / Income ----
-    private fun entries(col: MongoCollection<Document>, labelKey: String): List<Entry> =
-        col.find().map {
-            val created = (it["createdAt"] as Number).toLong()
+    // ---- Expenses / income ----
+    private fun entries(name: String, accountKey: String): List<Entry> =
+        col(name).find().map {
             Entry(
-                id = it.getObjectId("_id").toHexString(),
-                bankId = it.getString("bankId"),
-                bankName = it.getString("bankName"),
-                currency = it.getString("currency"),
-                amount = (it["amount"] as Number).toDouble(),
-                label = it.getString(labelKey),
-                // Entries saved before dates existed fall back to the day they were created.
-                date = (it["date"] as? Number)?.toLong() ?: java.time.Instant.ofEpochMilli(created)
-                    .atZone(java.time.ZoneId.systemDefault()).toLocalDate()
-                    .atStartOfDay(java.time.ZoneOffset.UTC).toInstant().toEpochMilli(),
-                createdAt = created,
+                id = it.hexId(),
+                account = it.text(accountKey),
+                currency = normaliseCurrency(it.text("currency")),
+                amount = it.number("amount"),
+                label = it.text("category"),
+                date = parseDate(it.text("date")),
+                source = it.text("source").ifBlank { "direct" },
             )
-        }.toList().sortedWith(compareByDescending<Entry> { it.date }.thenByDescending { it.createdAt })
+        }.toList().sortedWith(compareByDescending<Entry> { it.date }.thenByDescending { it.id })
 
-    private fun entryDoc(bank: Bank, amount: Double, date: Long, labelKey: String, label: String) =
-        Document("bankId", bank.id).append("bankName", bank.name).append("currency", bank.currency)
-            .append("amount", amount).append("date", date).append(labelKey, label).append("createdAt", now())
-
-    suspend fun listExpenses() = io { entries(expenses, "usedFor") }
-    suspend fun addExpense(bank: Bank, amount: Double, date: Long, usedFor: String) = io {
-        expenses.insertOne(entryDoc(bank, amount, date, "usedFor", usedFor)); Unit
+    private fun insertEntry(
+        name: String, accountKey: String, account: String, amount: Double, category: String,
+        date: Long, currency: String, source: String,
+    ) {
+        val c = col(name)
+        c.insertOne(
+            Document("id", nextId(c)).append("amount", amount.toString()).append(accountKey, account)
+                .append("category", category).append("date", formatDate(date))
+                .append("currency", currency).append("source", source)
+        )
     }
-    suspend fun deleteExpense(id: String) = io { expenses.deleteOne(Filters.eq("_id", ObjectId(id))); Unit }
 
-    suspend fun listIncome() = io { entries(incomes, "source") }
-    suspend fun addIncome(bank: Bank, amount: Double, date: Long, source: String) = io {
-        incomes.insertOne(entryDoc(bank, amount, date, "source", source)); Unit
+    suspend fun listExpenses() = io { entries("expense", "from") }
+    suspend fun listIncome() = io { entries("income", "to") }
+
+    suspend fun addExpense(account: Account, amount: Double, date: Long, category: String) = io {
+        insertEntry("expense", "from", account.name, amount, category, date, account.currency, "direct")
     }
-    suspend fun deleteIncome(id: String) = io { incomes.deleteOne(Filters.eq("_id", ObjectId(id))); Unit }
 
-    // ---- Credit tracker ----
-    suspend fun listCredits(): List<Credit> = io {
-        credits.find().sort(Sorts.descending("createdAt")).map {
-            Credit(
-                id = it.getObjectId("_id").toHexString(),
-                creditor = it.getString("creditor"),
-                amount = (it["amount"] as Number).toDouble(),
-                paid = (it["paid"] as Number).toDouble(),
-                createdAt = (it["createdAt"] as Number).toLong(),
+    suspend fun addIncome(account: Account, amount: Double, date: Long, category: String) = io {
+        insertEntry("income", "to", account.name, amount, category, date, account.currency, "direct")
+    }
+
+    suspend fun deleteExpense(id: String) = io { col("expense").deleteOne(Filters.eq("_id", ObjectId(id))); Unit }
+    suspend fun deleteIncome(id: String) = io { col("income").deleteOne(Filters.eq("_id", ObjectId(id))); Unit }
+
+    // ---- Transfers ----
+    suspend fun listTransfers(): List<Transfer> = io {
+        col("transfer").find().map {
+            Transfer(
+                id = it.hexId(), from = it.text("from"), to = it.text("to"), category = it.text("category"),
+                date = parseDate(it.text("date")), amount = it.number("amount"),
+                currency = normaliseCurrency(it.text("currency")),
+                toAmount = it.number("to_amount"), toCurrency = normaliseCurrency(it.text("to_currency")),
+                rate = it.number("rate").takeIf { r -> r > 0 } ?: 1.0,
+            )
+        }.toList().sortedWith(compareByDescending<Transfer> { it.date }.thenByDescending { it.id })
+    }
+
+    /** Records the transfer and the two legs Flask books with it (expense in sender's, income in receiver's currency). */
+    suspend fun addTransfer(from: Account, to: Account, amount: Double, category: String, date: Long, rate: Double) = io {
+        val toAmount = Math.round(amount * rate * 100) / 100.0
+        val c = col("transfer")
+        c.insertOne(
+            Document("id", nextId(c)).append("amount", amount.toString()).append("from", from.name)
+                .append("to", to.name).append("category", category).append("date", formatDate(date))
+                .append("currency", from.currency).append("to_amount", toAmount.toString())
+                .append("to_currency", to.currency).append("rate", rate)
+        )
+        insertEntry("income", "to", to.name, toAmount, category, date, to.currency, "transfer")
+        insertEntry("expense", "from", from.name, amount, category, date, from.currency, "transfer")
+    }
+
+    // ---- Debts ----
+    suspend fun listDebts(): List<Debt> = io {
+        val paid = col("debt_payment").find().toList()
+            .groupBy { (it.get("debt_id") as? Number)?.toInt() }
+            .mapValues { (_, v) -> v.sumOf { it.number("amount") } }
+        col("debt").find().sort(Sorts.descending("id")).map {
+            val id = (it.get("id") as? Number)?.toInt() ?: -1
+            Debt(
+                debtId = id, name = it.text("name"), description = it.text("description"),
+                currency = normaliseCurrency(it.text("currency")), amount = it.number("amount"),
+                paid = Math.round((paid[id] ?: 0.0) * 100) / 100.0,
             )
         }.toList()
     }
 
-    suspend fun addCredit(creditor: String, amount: Double, paid: Double) = io {
-        credits.insertOne(
-            Document("creditor", creditor).append("amount", amount).append("paid", paid).append("createdAt", now())
-        ); Unit
+    suspend fun addDebt(name: String, amount: Double, description: String, currency: String) = io {
+        val c = col("debt")
+        c.insertOne(
+            Document("id", nextId(c)).append("name", name).append("amount", amount.toString())
+                .append("description", description).append("currency", currency)
+        )
+        Unit
     }
 
-    /** Adds [extra] to the amount already paid. */
-    suspend fun addCreditPayment(id: String, extra: Double) = io {
-        credits.updateOne(Filters.eq("_id", ObjectId(id)), Updates.inc("paid", extra)); Unit
+    /**
+     * Records a payment against [debt]. With [from], the payment is also booked as a "Debt Payment" expense of
+     * [spent] (the payment converted into the account's currency), as the Flask app does.
+     */
+    suspend fun addDebtPayment(debt: Debt, amount: Double, date: Long, from: Account?, spent: Double?) = io {
+        if (from != null && spent != null)
+            insertEntry("expense", "from", from.name, spent, DEBT_PAYMENT_CATEGORY, date, from.currency, "direct")
+        val c = col("debt_payment")
+        c.insertOne(
+            Document("id", nextId(c)).append("debt_id", debt.debtId).append("amount", amount.toString())
+                .append("currency", debt.currency).append("date", formatDate(date))
+                .append("from_account", from?.name.orEmpty())
+        )
+        Unit
     }
 
-    suspend fun deleteCredit(id: String) = io { credits.deleteOne(Filters.eq("_id", ObjectId(id))); Unit }
+    // ---- Exchange rates & settings (read-only here; edited in the Flask app) ----
+    suspend fun listRates(): List<ExchangeRate> = io {
+        col("exchange_rate").find().map {
+            ExchangeRate(it.text("base_currency"), it.text("quote_currency"), it.number("rate"), it.text("date"))
+        }.toList()
+    }
 
-    private fun now() = System.currentTimeMillis()
+    suspend fun displayCurrency(): String = io {
+        normaliseCurrency(col("app_settings").find(Filters.eq("key", "display_currency")).firstOrNull()?.text("value"))
+    }
 }
